@@ -2,9 +2,9 @@ use crate::base::errors::Error;
 use crate::base::events::{
     emit_contribution, emit_creator_is_member, emit_distribution, emit_fundraising_cancelled,
     emit_fundraising_target_updated, emit_max_members_updated, emit_member_removed,
-    emit_usage_fee_updated, AdminTransferred, AutoshareCreated, AutoshareUpdated, ContractPaused,
-    ContractUnpaused, FundraisingStarted, GroupActivated, GroupDeactivated, GroupDeleted,
-    GroupNameUpdated, GroupOwnershipTransferred, Withdrawal,
+    emit_payment_group_deactivated, emit_usage_fee_updated, AdminTransferred, AutoshareCreated,
+    AutoshareUpdated, ContractPaused, ContractUnpaused, FundraisingStarted, GroupActivated,
+    GroupDeactivated, GroupDeleted, GroupNameUpdated, GroupOwnershipTransferred, Withdrawal,
 };
 
 use crate::base::types::{
@@ -169,6 +169,7 @@ pub fn create_autoshare(
     let details = AutoShareDetails {
         id: id.clone(),
         name,
+        metadata: String::from_str(&env, ""),
         creator: creator.clone(),
         usage_count,
         total_usages_paid: usage_count,
@@ -335,8 +336,9 @@ pub fn get_group_summary(env: Env, id: BytesN<32>) -> Result<GroupSummary, Error
     }
 
     Ok(GroupSummary {
-        id,
+        id: details.id,
         name: details.name,
+        metadata: details.metadata,
         creator: details.creator,
         member_count: details.members.len() as u32,
         is_active: details.is_active,
@@ -684,7 +686,10 @@ pub fn add_group_member(
 
     AutoshareUpdated {
         id: id.clone(),
-        updater: caller.clone(),
+        updater: caller,
+        name_updated: false,
+        metadata_updated: false,
+        new_creator: None,
     }
     .publish(&env);
 
@@ -795,6 +800,9 @@ pub fn batch_add_members(
     AutoshareUpdated {
         id: id.clone(),
         updater: caller,
+        name_updated: false,
+        metadata_updated: false,
+        new_creator: None,
     }
     .publish(&env);
 
@@ -878,6 +886,9 @@ pub fn remove_group_member(
     AutoshareUpdated {
         id: id.clone(),
         updater: caller,
+        name_updated: false,
+        metadata_updated: false,
+        new_creator: None,
     }
     .publish(&env);
 
@@ -1731,6 +1742,9 @@ pub fn update_members(
     AutoshareUpdated {
         id: id.clone(),
         updater: caller,
+        name_updated: false,
+        metadata_updated: false,
+        new_creator: None,
     }
     .publish(&env);
     Ok(())
@@ -1772,9 +1786,37 @@ pub fn deactivate_group(env: Env, id: BytesN<32>, caller: Address) -> Result<(),
 }
 
 /// Deactivates a payment group so it can no longer accept new distributions or member changes.
-/// This is a protocol-level alias of `deactivate_group` to keep storage, auth, and events aligned.
+/// Emits a dedicated `PaymentGroupDeactivated` event with indexed group id and caller for off-chain indexing.
 pub fn deactivate_payment_group(env: Env, id: BytesN<32>, caller: Address) -> Result<(), Error> {
-    deactivate_group(env, id, caller)
+    caller.require_auth();
+
+    if get_paused_status(&env) {
+        return Err(Error::ContractPaused);
+    }
+
+    let key = DataKey::AutoShare(id.clone());
+    let mut details: AutoShareDetails = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(Error::NotFound)?;
+    bump_persistent(&env, &key);
+
+    if details.creator != caller {
+        return Err(Error::Unauthorized);
+    }
+
+    if !details.is_active {
+        return Err(Error::GroupAlreadyInactive);
+    }
+
+    let member_count = details.members.len();
+    details.is_active = false;
+    env.storage().persistent().set(&key, &details);
+    bump_persistent(&env, &key);
+
+    emit_payment_group_deactivated(&env, id, caller, member_count);
+    Ok(())
 }
 
 pub fn activate_group(env: Env, id: BytesN<32>, caller: Address) -> Result<(), Error> {
@@ -1851,6 +1893,110 @@ pub fn update_group_name(
         updater: caller,
     }
     .publish(&env);
+    Ok(())
+}
+
+/// Updates the configurable settings of an existing payment group.
+///
+/// This function allows the group creator to update the group name, metadata, and 
+/// transfer ownership (admin rotation) in a single transaction. Only the current
+/// creator is authorized to perform these updates.
+///
+/// # Arguments
+///
+/// * `env` - The Soroban environment.
+/// * `id` - The unique 32-byte identifier of the payment group.
+/// * `caller` - The address of the current creator. Must authorize this call.
+/// * `new_name` - Optional new name for the group (1–60 non-whitespace characters).
+/// * `new_metadata` - Optional new metadata string for the group.
+/// * `new_creator` - Optional new address to transfer group ownership to.
+///
+/// # Returns
+///
+/// Returns `Ok(())` on success.
+///
+/// # Events
+///
+/// Emits [`AutoshareUpdated`] with detailed change flags and new values.
+///
+/// # Errors
+///
+/// | Error | Condition |
+/// |---|---|
+/// | `ContractPaused` | The contract is currently paused. |
+/// | `NotFound` | No group exists with the given `id`. |
+/// | `Unauthorized` | The `caller` is not the current group creator. |
+/// | `GroupInactive` | The group is currently deactivated. |
+/// | `EmptyName` | The `new_name` is empty or whitespace-only. |
+pub fn update_payment_group(
+    env: Env,
+    id: BytesN<32>,
+    caller: Address,
+    new_name: Option<String>,
+    new_metadata: Option<String>,
+    new_creator: Option<Address>,
+) -> Result<(), Error> {
+    caller.require_auth();
+
+    if get_paused_status(&env) {
+        return Err(Error::ContractPaused);
+    }
+
+    let key = DataKey::AutoShare(id.clone());
+    let mut details: AutoShareDetails = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(Error::NotFound)?;
+
+    if details.creator != caller {
+        return Err(Error::Unauthorized);
+    }
+
+    if !details.is_active {
+        return Err(Error::GroupInactive);
+    }
+
+    let mut updated = false;
+    let mut name_updated = false;
+    let mut metadata_updated = false;
+    let mut new_creator_addr: Option<Address> = None;
+
+    if let Some(name) = new_name {
+        if !is_valid_name(&name) {
+            return Err(Error::EmptyName);
+        }
+        details.name = name;
+        updated = true;
+        name_updated = true;
+    }
+
+    if let Some(metadata) = new_metadata {
+        details.metadata = metadata;
+        updated = true;
+        metadata_updated = true;
+    }
+
+    if let Some(creator) = new_creator {
+        details.creator = creator.clone();
+        updated = true;
+        new_creator_addr = Some(creator);
+    }
+
+    if updated {
+        env.storage().persistent().set(&key, &details);
+        bump_persistent(&env, &key);
+
+        AutoshareUpdated {
+            id,
+            updater: caller,
+            name_updated,
+            metadata_updated,
+            new_creator: new_creator_addr,
+        }
+        .publish(&env);
+    }
+
     Ok(())
 }
 

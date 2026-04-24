@@ -52,12 +52,16 @@ pub struct ContractPaused {}
 #[derive(Clone)]
 pub struct ContractUnpaused {}
 
-#[contractevent(data_format = "single-value")]
+#[contractevent]
 #[derive(Clone)]
 pub struct AutoshareUpdated {
     #[topic]
-    pub updater: Address,
     pub id: BytesN<32>,
+    #[topic]
+    pub updater: Address,
+    pub name_updated: bool,
+    pub metadata_updated: bool,
+    pub new_creator: Option<Address>,
 }
 
 #[contractevent(data_format = "single-value")]
@@ -66,6 +70,32 @@ pub struct GroupDeactivated {
     #[topic]
     pub creator: Address,
     pub id: BytesN<32>,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct PaymentGroupDeactivated {
+    #[topic]
+    pub id: BytesN<32>,
+    #[topic]
+    pub caller: Address,
+    pub member_count: u32,
+    pub timestamp: u64,
+}
+
+pub fn emit_payment_group_deactivated(
+    env: &Env,
+    id: BytesN<32>,
+    caller: Address,
+    member_count: u32,
+) {
+    PaymentGroupDeactivated {
+        id,
+        caller,
+        member_count,
+        timestamp: env.ledger().timestamp(),
+    }
+    .publish(env);
 }
 
 #[contractevent(data_format = "single-value")]
